@@ -200,6 +200,68 @@ describe('EscrowService', () => {
       );
     });
 
+    it('keeps the escrow LOCKED when the on-chain call succeeded but the local write failed (#302, #42)', async () => {
+      // First save (the PENDING row) succeeds; the post-invoke save fails —
+      // exactly the post-on-chain-success failure #42 describes.
+      escrowRepo.save
+        .mockResolvedValueOnce({ id: 'escrow-1' } as Partial<Escrow>)
+        .mockRejectedValueOnce(new Error('connection terminated unexpectedly'));
+
+      await expect(
+        service.fund({
+          amount: '10',
+          asset: AssetType.XLM,
+          funderAddress: 'G...',
+          bountyId: 'bounty-1',
+        }),
+      ).rejects.toThrow('connection terminated unexpectedly');
+
+      // The row must never be marked FAILED: the funds really are locked.
+      const savedCalls = (
+        escrowRepo.save.mock.calls as [Partial<Escrow>][]
+      ).map((c) => c[0]);
+      expect(
+        savedCalls.some((e) => e.status === EscrowStatus.FAILED),
+      ).toBe(false);
+      expect(
+        savedCalls.every((e) => e.status !== EscrowStatus.FAILED),
+      ).toBe(true);
+
+      // The retry records the reconciliation marker (and keeps the LOCKED
+      // status + tx hash) so a reconciliation job can find the row.
+      const retry = savedCalls[savedCalls.length - 1];
+      expect(retry.status).toBe(EscrowStatus.LOCKED);
+      expect(retry.fundTxHash).toBe('tx-hash-123');
+      expect(retry.metadata).toEqual(
+        expect.objectContaining({
+          lastFailure: expect.objectContaining({ operation: 'fund' }),
+        }),
+      );
+    });
+
+    it('surfaces the original error when the post-invoke retry also fails (#302)', async () => {
+      // PENDING row persists, then every post-invoke write fails too.
+      escrowRepo.save
+        .mockResolvedValueOnce({ id: 'escrow-1' } as Partial<Escrow>)
+        .mockRejectedValue(new Error('pool exhausted'));
+
+      await expect(
+        service.fund({
+          amount: '10',
+          asset: AssetType.XLM,
+          funderAddress: 'G...',
+          bountyId: 'bounty-1',
+        }),
+      ).rejects.toThrow('pool exhausted');
+
+      const savedCalls = (
+        escrowRepo.save.mock.calls as [Partial<Escrow>][]
+      ).map((c) => c[0]);
+      expect(
+        savedCalls.some((e) => e.status === EscrowStatus.FAILED),
+      ).toBe(false);
+    });
+
     it.each([
       '0',
       '-1',
