@@ -17,6 +17,7 @@ import {
 import {
   ContractInvocationResult,
   SorobanClientService,
+  u64,
 } from './soroban-client.service';
 import {
   apportionBasisPoints,
@@ -99,30 +100,61 @@ export class EscrowService {
     escrow.deadline = deadline;
     await this.escrowRepo.save(escrow);
 
+    let result: ContractInvocationResult;
     try {
       // escrow::fund(issue_id: u64, sponsor: Address, token: Address,
       //              amount: i128, deadline: u64) -> Result<(), Error>  (#158)
-      const result = await this.soroban.invoke(
+      // `issue_id` and `deadline` are declared u64, so they are wrapped in
+      // `u64(...)` — a bare bigint would encode as ScVal::I128 and fail
+      // host-side argument binding (#301). `amount` really is i128 and stays
+      // a plain bigint.
+      result = await this.soroban.invoke(
         'fund',
         [
-          BigInt(escrow.onChainId),
+          u64(BigInt(escrow.onChainId)),
           input.funderAddress,
           this.resolveTokenAddress(input.asset),
           this.toStroops(input.amount),
-          BigInt(Math.floor(deadline.getTime() / 1000)),
+          u64(BigInt(Math.floor(deadline.getTime() / 1000))),
         ],
         this.contractOpts(escrow),
       );
-
-      escrow.status = EscrowStatus.LOCKED;
-      escrow.fundTxHash = result.txHash;
-      escrow.lockedAt = new Date();
-      escrow.metadata = { fund: result };
-      return this.escrowRepo.save(escrow);
     } catch (err) {
+      // Only reached when the *contract call* failed: nothing was locked
+      // on-chain, so FAILED is the truthful state.
       escrow.status = EscrowStatus.FAILED;
       escrow.metadata = { error: (err as Error).message };
       await this.escrowRepo.save(escrow);
+      throw err;
+    }
+
+    escrow.status = EscrowStatus.LOCKED;
+    escrow.fundTxHash = result.txHash;
+    escrow.lockedAt = new Date();
+    escrow.metadata = { fund: result };
+
+    try {
+      return await this.escrowRepo.save(escrow);
+    } catch (err) {
+      // The funds ARE locked on-chain — only the local ledger write failed
+      // (pool exhaustion, constraint violation, connection drop). Marking
+      // the escrow FAILED here is what #42 describes: the ledger would claim
+      // no funds are locked while the contract holds them. Keep the truthful
+      // LOCKED status (and the tx hash) and record the failure so a
+      // reconciliation job can find and repair the row (#302, #42, #8) —
+      // mirroring invokeOnLockedEscrow's `lastFailure` shape (#89).
+      escrow.metadata = {
+        ...(escrow.metadata ?? {}),
+        lastFailure: {
+          operation: 'fund',
+          error: (err as Error).message,
+          at: new Date().toISOString(),
+        },
+      };
+      // A second failure here means the row is genuinely unreachable; the
+      // tx hash above is the only remaining trace, so the original error is
+      // what propagates.
+      await this.escrowRepo.save(escrow).catch(() => undefined);
       throw err;
     }
   }
@@ -399,7 +431,8 @@ export class EscrowService {
     const result = await this.invokeOnLockedEscrow(escrow, 'refund', () =>
       this.soroban.invoke(
         'refund',
-        [this.onChainKeyFor(escrow)],
+        // `refund(issue_id: u64, ...)` — u64-typed on-chain, not i128 (#301).
+        [u64(this.onChainKeyFor(escrow))],
         this.contractOpts(escrow),
       ),
     );
@@ -551,6 +584,13 @@ export class EscrowService {
     recipients: Array<[string, number]>,
     manager?: EntityManager,
   ): Promise<ContractInvocationResult> {
+    return this.invokeOnLockedEscrow(escrow, operation, () =>
+      this.soroban.invoke(
+        'release',
+        // `release(issue_id: u64, recipients)` — u64-typed on-chain (#301).
+        [u64(this.onChainKeyFor(escrow)), recipients],
+        this.contractOpts(escrow),
+      ),
     return this.invokeOnLockedEscrow(
       escrow,
       operation,
