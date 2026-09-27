@@ -38,6 +38,15 @@ const CLOSING_KEYWORD_RE =
   /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*(?<repo>[\w.-]+\/[\w.-]+)?#(?<number>\d+)/gi;
 
 /**
+ * Matches a continuation of a closing-keyword list — the `, #22` in
+ * "Closes #10, #22, #33", which GitHub documents as linking every issue in a
+ * comma-separated list introduced by a single keyword (#309). Anchored so it
+ * only ever matches immediately after the previous reference (or a comma).
+ */
+const CLOSING_KEYWORD_CONTINUATION_RE =
+  /^\s*,\s*(?<repo>[\w.-]+\/[\w.-]+)?#(?<number>\d+)/;
+
+/**
  * The outcome of processing one issue number linked from a merged PR's
  * body — tracked per-issue rather than collapsing a whole PR's several
  * linked bounties into one pass/fail, so a failure on one doesn't hide
@@ -294,22 +303,45 @@ export class GithubWebhooksService {
    * reference is for an issue in a different repository entirely and must
    * not be resolved against this one (compared case-insensitively, as
    * GitHub owner/repo names are).
+   *
+   * GitHub also links every issue in a comma-separated list introduced by a
+   * single keyword ("Closes #10, #22, #33"), so after each keyword match the
+   * rest of that list is scanned forward too — continuing only while each
+   * next token really is another `, #number` reference and stopping at the
+   * first thing that isn't (#309). A comma-separated reference qualified with
+   * a foreign owner/repo is skipped exactly like a standalone one.
    */
   private extractLinkedIssueNumbers(
     body: string,
     repoFullName: string,
   ): number[] {
+    const isSameRepo = (repoQualifier?: string) =>
+      !repoQualifier || repoQualifier.toLowerCase() === repoFullName.toLowerCase();
+
     const matches = [...body.matchAll(CLOSING_KEYWORD_RE)];
     const numbers: number[] = [];
     for (const m of matches) {
+      const matchStart = m.index ?? 0;
       const repoQualifier = m.groups?.repo;
-      if (
-        repoQualifier &&
-        repoQualifier.toLowerCase() !== repoFullName.toLowerCase()
-      ) {
+      if (!isSameRepo(repoQualifier)) {
         continue;
       }
       numbers.push(parseInt(m.groups!.number, 10));
+
+      // Continue the comma-separated list that this keyword introduced.
+      let cursor = matchStart + m[0].length;
+      for (;;) {
+        const rest = body.slice(cursor);
+        const continuation = CLOSING_KEYWORD_CONTINUATION_RE.exec(rest);
+        if (!continuation) {
+          break;
+        }
+        cursor += continuation[0].length;
+        if (!isSameRepo(continuation.groups?.repo)) {
+          continue;
+        }
+        numbers.push(parseInt(continuation.groups!.number, 10));
+      }
     }
     return numbers;
   }

@@ -624,4 +624,150 @@ describe('GithubWebhooksService', () => {
       expect(event.error).toContain('escrow release failed');
     });
   });
+
+  describe('comma-separated closing references (#309)', () => {
+    /** Collects every issue number the merged-PR path ends up releasing. */
+    function releasedNumbers(): number[] {
+      return issueRepo.findOne.mock.calls.map(
+        (call: unknown[]) =>
+          (call[0] as { where: { number: number } }).where.number,
+      );
+    }
+
+    it('links every issue in a comma-separated list after one keyword', async () => {
+      issueRepo.findOne.mockResolvedValue(null);
+      await service.handleEvent(
+        'pull_request',
+        'delivery-comma-list',
+        {
+          action: 'closed',
+          number: 11,
+          pull_request: {
+            html_url: 'https://github.com/acme/repo/pull/11',
+            number: 11,
+            merged: true,
+            body: 'Closes #10, #22, #33',
+          },
+          repository: { id: 999, full_name: 'acme/repo' },
+        },
+        true,
+      );
+
+      expect(releasedNumbers()).toEqual([10, 22, 33]);
+    });
+
+    it('keeps parsing subsequent keyword lists after a comma run', async () => {
+      issueRepo.findOne.mockResolvedValue(null);
+      await service.handleEvent(
+        'pull_request',
+        'delivery-comma-then-keyword',
+        {
+          action: 'closed',
+          number: 12,
+          pull_request: {
+            html_url: 'https://github.com/acme/repo/pull/12',
+            number: 12,
+            merged: true,
+            body: 'This PR closes #10, #22, #33 and also fixes #99.',
+          },
+          repository: { id: 999, full_name: 'acme/repo' },
+        },
+        true,
+      );
+
+      expect(releasedNumbers()).toEqual([10, 22, 33, 99]);
+    });
+
+    it('stops the comma run at the first token that is not a reference', async () => {
+      issueRepo.findOne.mockResolvedValue(null);
+      await service.handleEvent(
+        'pull_request',
+        'delivery-comma-stops',
+        {
+          action: 'closed',
+          number: 13,
+          pull_request: {
+            html_url: 'https://github.com/acme/repo/pull/13',
+            number: 13,
+            merged: true,
+            body: 'Closes #1, and #2',
+          },
+          repository: { id: 999, full_name: 'acme/repo' },
+        },
+        true,
+      );
+
+      expect(releasedNumbers()).toEqual([1]);
+    });
+
+    it('skips a foreign-repo qualifier inside a comma run but keeps the rest', async () => {
+      issueRepo.findOne.mockResolvedValue(null);
+      await service.handleEvent(
+        'pull_request',
+        'delivery-comma-foreign',
+        {
+          action: 'closed',
+          number: 14,
+          pull_request: {
+            html_url: 'https://github.com/acme/repo/pull/14',
+            number: 14,
+            merged: true,
+            body: 'Fixes #7, some-other-org/other-repo#8, #9',
+          },
+          repository: { id: 999, full_name: 'acme/repo' },
+        },
+        true,
+      );
+
+      expect(releasedNumbers()).toEqual([7, 9]);
+    });
+
+    it('marks a comma-separated bounty in review when the PR is opened', async () => {
+      issueRepo.findOne.mockImplementation(
+        ({ where }: { where: { number: number } }) =>
+          Promise.resolve({
+            id: `issue-${where.number}`,
+            bounty: { id: `bounty-${where.number}` },
+          }),
+      );
+      bountyRepo.findOne.mockImplementation(
+        ({ where }: { where: { id: string } }) =>
+          Promise.resolve({ id: where.id, status: 'claimed' }),
+      );
+
+      await service.handleEvent(
+        'pull_request',
+        'delivery-comma-opened',
+        {
+          action: 'opened',
+          number: 15,
+          pull_request: {
+            html_url: 'https://github.com/acme/repo/pull/15',
+            number: 15,
+            merged: false,
+            body: 'Closes #10, #22, #33',
+          },
+          repository: { id: 999, full_name: 'acme/repo' },
+        },
+        true,
+      );
+
+      expect(bountiesService.markInReview).toHaveBeenCalledTimes(3);
+      expect(bountiesService.markInReview).toHaveBeenCalledWith(
+        'bounty-10',
+        'https://github.com/acme/repo/pull/15',
+        15,
+      );
+      expect(bountiesService.markInReview).toHaveBeenCalledWith(
+        'bounty-22',
+        'https://github.com/acme/repo/pull/15',
+        15,
+      );
+      expect(bountiesService.markInReview).toHaveBeenCalledWith(
+        'bounty-33',
+        'https://github.com/acme/repo/pull/15',
+        15,
+      );
+    });
+  });
 });
