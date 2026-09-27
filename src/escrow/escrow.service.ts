@@ -17,6 +17,7 @@ import {
 import {
   ContractInvocationResult,
   SorobanClientService,
+  u64,
 } from './soroban-client.service';
 import {
   apportionBasisPoints,
@@ -102,14 +103,18 @@ export class EscrowService {
     try {
       // escrow::fund(issue_id: u64, sponsor: Address, token: Address,
       //              amount: i128, deadline: u64) -> Result<(), Error>  (#158)
+      // `issue_id` and `deadline` are declared u64, so they are wrapped in
+      // `u64(...)` — a bare bigint would encode as ScVal::I128 and fail
+      // host-side argument binding (#301). `amount` really is i128 and stays
+      // a plain bigint.
       const result = await this.soroban.invoke(
         'fund',
         [
-          BigInt(escrow.onChainId),
+          u64(BigInt(escrow.onChainId)),
           input.funderAddress,
           this.resolveTokenAddress(input.asset),
           this.toStroops(input.amount),
-          BigInt(Math.floor(deadline.getTime() / 1000)),
+          u64(BigInt(Math.floor(deadline.getTime() / 1000))),
         ],
         this.contractOpts(escrow),
       );
@@ -390,7 +395,8 @@ export class EscrowService {
     const result = await this.invokeOnLockedEscrow(escrow, 'refund', () =>
       this.soroban.invoke(
         'refund',
-        [this.onChainKeyFor(escrow)],
+        // `refund(issue_id: u64, ...)` — u64-typed on-chain, not i128 (#301).
+        [u64(this.onChainKeyFor(escrow))],
         this.contractOpts(escrow),
       ),
     );
@@ -500,7 +506,8 @@ export class EscrowService {
     return this.invokeOnLockedEscrow(escrow, operation, () =>
       this.soroban.invoke(
         'release',
-        [this.onChainKeyFor(escrow), recipients],
+        // `release(issue_id: u64, recipients)` — u64-typed on-chain (#301).
+        [u64(this.onChainKeyFor(escrow)), recipients],
         this.contractOpts(escrow),
       ),
     );

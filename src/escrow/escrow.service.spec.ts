@@ -3,7 +3,7 @@ import { getRepositoryToken } from '@nestjs/typeorm';
 import { BadRequestException } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { EscrowService } from './escrow.service';
-import { SorobanClientService } from './soroban-client.service';
+import { SorobanClientService, u64 } from './soroban-client.service';
 import { Escrow, Payment, User } from '../common/entities';
 import { AssetType, EscrowStatus, PaymentStatus } from '../common/enums';
 import { TOTAL_BASIS_POINTS } from './split-math.util';
@@ -100,7 +100,9 @@ describe('EscrowService', () => {
         unknown[],
       ];
       expect(method).toBe('fund');
-      expect(args[0]).toBe(4242n);
+      // issue_id is u64 in the escrow ABI — wrapped so the client encodes
+      // ScVal::U64 instead of ScVal::I128 (#301).
+      expect(args[0]).toEqual(u64(4242n));
       expect(args[1]).toBe('GABC...FUNDER');
       expect(args[3]).toBe(1_000_000_000n);
       expect(typeof args[4]).toBe('bigint');
@@ -123,7 +125,10 @@ describe('EscrowService', () => {
 
       const [, args] = soroban.invoke.mock.calls[0] as [string, unknown[]];
       expect(args[2]).toBe('CUSDCTOKEN');
-      expect(args[4]).toBe(BigInt(Math.floor(deadline.getTime() / 1000)));
+      // deadline is u64 in the escrow ABI (#301).
+      expect(args[4]).toEqual(
+        u64(BigInt(Math.floor(deadline.getTime() / 1000))),
+      );
       expect(escrow.onChainId).toBe('77');
       expect(escrow.deadline).toBe(deadline);
     });
@@ -299,7 +304,7 @@ describe('EscrowService', () => {
       // release() recipients vector (#161).
       expect(soroban.invoke).toHaveBeenCalledWith(
         'release',
-        [9100n, [['GRECIPIENT', TOTAL_BASIS_POINTS]]],
+        [u64(9100n), [['GRECIPIENT', TOTAL_BASIS_POINTS]]],
         {},
       );
       expect(paymentRepo.save).toHaveBeenCalledWith(
@@ -484,7 +489,7 @@ describe('EscrowService', () => {
 
       const escrow = await service.refund('escrow-refund');
 
-      expect(soroban.invoke).toHaveBeenCalledWith('refund', [7007n], {});
+      expect(soroban.invoke).toHaveBeenCalledWith('refund', [u64(7007n)], {});
       expect(escrow.status).toBe(EscrowStatus.REFUNDED);
       expect(escrow.refundTxHash).toBe('tx-hash-123');
       expect(escrow.refundedAt).toBeInstanceOf(Date);
@@ -630,7 +635,7 @@ describe('EscrowService', () => {
         unknown[],
       ];
       expect(method).toBe('release');
-      expect(args[0]).toBe(8801n);
+      expect(args[0]).toEqual(u64(8801n));
       const recipients = args[1] as Array<[string, number]>;
       expect(recipients.map((r) => r[0])).toEqual(['GA', 'GB', 'GC']);
       expect(recipients.reduce((sum, r) => sum + r[1], 0)).toBe(10_000);
@@ -671,7 +676,7 @@ describe('EscrowService', () => {
 
       expect(soroban.invoke).toHaveBeenCalledWith(
         'release',
-        [3003n, [['GRECIPIENT', 10_000]]],
+        [u64(3003n), [['GRECIPIENT', 10_000]]],
         {},
       );
     });
