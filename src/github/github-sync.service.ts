@@ -88,11 +88,42 @@ export class GithubSyncService {
     @Optional() private readonly eventEmitter?: EventEmitter2,
   ) {}
 
+  /**
+   * Syncs one page of a repository's issues.
+   *
+   * Since the pagination cap (#129) each call handles exactly one page, so a
+   * caller walking a 1,000-issue repo makes 10 sequential calls. Page 1 (and
+   * any call for a repository we have no row for yet) fetches the repository
+   * metadata from GitHub and upserts it; continuation pages reuse the
+   * already-persisted `Repository` row instead, because the metadata
+   * (stargazers, description, default branch) does not meaningfully change
+   * between two calls made seconds apart (#314). Re-fetching it on every
+   * continuation page doubled GitHub API usage — precisely in the large-repo
+   * case the pagination cap exists to keep affordable.
+   */
   async syncRepository(
     owner: string,
     repo: string,
     page = 1,
   ): Promise<{ repository: Repository; synced: number; nextPage?: number }> {
+    if (page > 1) {
+      const existing = await this.repositoryRepo.findOne({
+        where: { owner, name: repo },
+      });
+      if (existing) {
+        this.logger.log(
+          `Continuing sync of ${owner}/${repo} at page ${page} from the ` +
+            `persisted repository record (skipping the repos.get() refresh)`,
+        );
+        const result = await this.syncIssues(existing, owner, repo, page);
+        return {
+          repository: existing,
+          synced: result.saved.length,
+          nextPage: result.nextPage,
+        };
+      }
+    }
+
     const repoResponse = await this.octokit.repos.get({ owner, repo });
     this.logRateLimitFromHeaders(
       `before ${owner}/${repo}`,
