@@ -183,7 +183,18 @@ export class GithubWebhooksService {
   private async handlePullRequest(
     payload: GithubPullRequestPayload,
   ): Promise<LinkedIssueOutcome[]> {
-    if (payload.action === 'opened' || payload.action === 'reopened') {
+    // #310 — `edited` is routed the same as `opened`/`reopened`: a contributor
+    // who opens a PR (or a draft) before writing the description only gets
+    // the closing keyword in later, and GitHub delivers that as an `edited`
+    // event. Without this, a bounty referenced only after the initial body
+    // stays CLAIMED for the whole review window even though a real PR is open
+    // against it. The handler is idempotent — it only touches bounties that
+    // are still CLAIMED — so re-running it on every body edit is safe.
+    if (
+      payload.action === 'opened' ||
+      payload.action === 'reopened' ||
+      payload.action === 'edited'
+    ) {
       return this.handlePullRequestOpened(payload);
     }
 

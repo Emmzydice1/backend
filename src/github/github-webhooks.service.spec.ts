@@ -770,4 +770,96 @@ describe('GithubWebhooksService', () => {
       );
     });
   });
+
+  describe('pull_request edited events (#310)', () => {
+    it('moves a bounty to in_review when a closing keyword is added after opening', async () => {
+      issueRepo.findOne.mockImplementation(
+        ({ where }: { where: { number: number } }) =>
+          Promise.resolve({
+            id: `issue-${where.number}`,
+            bounty: { id: 'bounty-42' },
+          }),
+      );
+      bountyRepo.findOne.mockImplementation(
+        ({ where }: { where: { id: string } }) =>
+          Promise.resolve({ id: where.id, status: 'claimed' }),
+      );
+
+      const event = await service.handleEvent(
+        'pull_request',
+        'delivery-edited',
+        {
+          action: 'edited',
+          number: 42,
+          pull_request: {
+            html_url: 'https://github.com/acme/repo/pull/42',
+            number: 42,
+            merged: false,
+            body: 'Added the description: Fixes #42',
+          },
+          repository: { id: 999, full_name: 'acme/repo' },
+        },
+        true,
+      );
+
+      expect(bountiesService.markInReview).toHaveBeenCalledWith(
+        'bounty-42',
+        'https://github.com/acme/repo/pull/42',
+        42,
+      );
+      expect(event.status).toBe(WebhookEventStatus.PROCESSED);
+    });
+
+    it('leaves a bounty already in_review untouched on a later body edit', async () => {
+      issueRepo.findOne.mockResolvedValue({
+        id: 'issue-42',
+        bounty: { id: 'bounty-42' },
+      });
+      bountyRepo.findOne.mockResolvedValue({
+        id: 'bounty-42',
+        status: 'in_review',
+      });
+
+      await service.handleEvent(
+        'pull_request',
+        'delivery-edited-idem',
+        {
+          action: 'edited',
+          number: 42,
+          pull_request: {
+            html_url: 'https://github.com/acme/repo/pull/42',
+            number: 42,
+            merged: false,
+            body: 'Fixes #42 (typo fixes)',
+          },
+          repository: { id: 999, full_name: 'acme/repo' },
+        },
+        true,
+      );
+
+      expect(bountiesService.markInReview).not.toHaveBeenCalled();
+    });
+
+    it('still ignores unrelated actions without touching bounties', async () => {
+      await service.handleEvent(
+        'pull_request',
+        'delivery-synchronize',
+        {
+          action: 'synchronize',
+          number: 42,
+          pull_request: {
+            html_url: 'https://github.com/acme/repo/pull/42',
+            number: 42,
+            merged: false,
+            body: 'Fixes #42',
+          },
+          repository: { id: 999, full_name: 'acme/repo' },
+        },
+        true,
+      );
+
+      expect(bountiesService.markInReview).not.toHaveBeenCalled();
+      expect(bountiesService.markMergedAndRelease).not.toHaveBeenCalled();
+    });
+  });
 });
