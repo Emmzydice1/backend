@@ -558,6 +558,147 @@ describe('EscrowService', () => {
     });
   });
 
+  describe('poolWithdraw (#163)', () => {
+    const lockedPoolEscrow = () => ({
+      id: 'escrow-pool',
+      status: EscrowStatus.LOCKED,
+      amount: '500.0000000',
+      asset: AssetType.USDC,
+      maintenancePoolId: 'pool-1',
+      onChainId: '3303',
+    });
+
+    it('rejects a withdraw against an escrow that is not LOCKED', async () => {
+      escrowRepo.findOne.mockResolvedValue({
+        ...lockedPoolEscrow(),
+        status: EscrowStatus.PENDING,
+      });
+
+      await expect(
+        service.poolWithdraw('escrow-pool', '10.0000000', 'GRECIPIENT'),
+      ).rejects.toThrow(BadRequestException);
+
+      expect(soroban.invoke).not.toHaveBeenCalled();
+      expect(paymentRepo.save).not.toHaveBeenCalled();
+    });
+
+    it.each(['0', '-1', 'not-a-number', '1.00000001'])(
+      'rejects a malformed amount %s before any chain call',
+      async (amount) => {
+        escrowRepo.findOne.mockResolvedValue(lockedPoolEscrow());
+
+        await expect(
+          service.poolWithdraw('escrow-pool', amount, 'GRECIPIENT'),
+        ).rejects.toThrow(BadRequestException);
+
+        expect(soroban.invoke).not.toHaveBeenCalled();
+        expect(paymentRepo.save).not.toHaveBeenCalled();
+      },
+    );
+
+    it('rejects a recipientId whose address does not match the user on file (#92)', async () => {
+      escrowRepo.findOne.mockResolvedValue(lockedPoolEscrow());
+      userRepo.find.mockResolvedValue([
+        { id: 'user-1', stellarAddress: 'GSOMEONEELSE' },
+      ]);
+
+      await expect(
+        service.poolWithdraw(
+          'escrow-pool',
+          '10.0000000',
+          'GRECIPIENT',
+          'user-1',
+        ),
+      ).rejects.toThrow(BadRequestException);
+
+      expect(soroban.invoke).not.toHaveBeenCalled();
+      expect(paymentRepo.save).not.toHaveBeenCalled();
+    });
+
+    it('rejects a recipientId that does not correspond to a known user (#92)', async () => {
+      escrowRepo.findOne.mockResolvedValue(lockedPoolEscrow());
+      userRepo.find.mockResolvedValue([]);
+
+      await expect(
+        service.poolWithdraw(
+          'escrow-pool',
+          '10.0000000',
+          'GRECIPIENT',
+          'user-ghost',
+        ),
+      ).rejects.toThrow(/does not correspond to a known user/i);
+
+      expect(soroban.invoke).not.toHaveBeenCalled();
+    });
+
+    it('invokes the pool contract withdraw with the escrow key, recipient and stroops', async () => {
+      escrowRepo.findOne.mockResolvedValue(lockedPoolEscrow());
+      userRepo.find.mockResolvedValue([
+        { id: 'user-1', stellarAddress: 'GRECIPIENT' },
+      ]);
+
+      const payment = await service.poolWithdraw(
+        'escrow-pool',
+        '10.0000000',
+        'GRECIPIENT',
+        'user-1',
+      );
+
+      // The maintenance pool has no lock/partial-release model: it is a
+      // `withdraw(pool_id, recipient, amount)` call against the live pool
+      // balance, and the escrow row stays LOCKED (#163).
+      expect(soroban.invoke).toHaveBeenCalledWith(
+        'withdraw',
+        [3303n, 'GRECIPIENT', 100_000_000n],
+        {},
+      );
+      expect(paymentRepo.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          escrowId: 'escrow-pool',
+          recipientId: 'user-1',
+          recipientAddress: 'GRECIPIENT',
+          amount: '10.0000000',
+          asset: AssetType.USDC,
+          status: PaymentStatus.CONFIRMED,
+          txHash: 'tx-hash-123',
+        }),
+      );
+      expect(payment.amount).toBe('10.0000000');
+    });
+
+    it('leaves the escrow row LOCKED after a withdraw (pool is not closed out)', async () => {
+      escrowRepo.findOne.mockResolvedValue(lockedPoolEscrow());
+
+      await service.poolWithdraw('escrow-pool', '10.0000000', 'GRECIPIENT');
+
+      expect(escrowRepo.save).not.toHaveBeenCalled();
+    });
+
+    it('records a failed withdraw via the invokeOnLockedEscrow failure path (#89) and keeps the escrow LOCKED', async () => {
+      const escrow = lockedPoolEscrow();
+      escrowRepo.findOne.mockResolvedValue(escrow);
+      soroban.invoke.mockRejectedValueOnce(new Error('withdraw simulation failed'));
+
+      await expect(
+        service.poolWithdraw('escrow-pool', '10.0000000', 'GRECIPIENT'),
+      ).rejects.toThrow('withdraw simulation failed');
+
+      expect(escrowRepo.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: 'escrow-pool',
+          metadata: expect.objectContaining({
+            lastFailure: expect.objectContaining({
+              operation: 'poolWithdraw',
+              error: 'withdraw simulation failed',
+            }),
+          }),
+        }),
+      );
+      expect(escrow.status).toBe(EscrowStatus.LOCKED);
+      expect(paymentRepo.save).not.toHaveBeenCalled();
+    });
+  });
+
   describe('contract targeting (#157)', () => {
     it('persists the escrow contract id on a bounty escrow and targets it on fund', async () => {
       soroban.escrowContractId = 'CESCROW';
