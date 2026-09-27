@@ -2,7 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import { Bounty, Issue, WebhookEvent } from '../common/entities';
+import { Bounty, WebhookEvent } from '../common/entities';
 import { BountyStatus, WebhookEventStatus } from '../common/enums';
 import { AppConfig } from '../config/configuration';
 import { verifyGithubSignature } from './webhook-signature.util';
@@ -49,6 +49,26 @@ interface LinkedIssueOutcome {
   error?: string;
 }
 
+/**
+ * What each pull_request branch contributes to {@link processLinkedIssues}:
+ * the bounty status it acts on, and the action to run. Resolving the issue,
+ * loading its bounty, and recording the per-issue outcome are identical across
+ * branches and live in the helper (#316).
+ */
+interface LinkedIssueAction {
+  /** Bounty status the branch acts on; anything else is skipped. */
+  requiredStatus: BountyStatus;
+  /** Runs before `action` when the bounty is in `requiredStatus`. */
+  preAction?: (bounty: Bounty) => Promise<void>;
+  action: (bounty: Bounty) => Promise<void>;
+  /**
+   * Act on a bounty that is not in `requiredStatus` too, skipping `preAction`.
+   * The merged-PR branch settles a bounty in any state; the other two branch
+   * flows must not act outside their own status.
+   */
+  alsoProcessOtherStatuses?: boolean;
+}
+
 @Injectable()
 export class GithubWebhooksService {
   private readonly logger = new Logger(GithubWebhooksService.name);
@@ -57,7 +77,6 @@ export class GithubWebhooksService {
     private readonly configService: ConfigService<AppConfig, true>,
     @InjectRepository(WebhookEvent)
     private readonly webhookEventRepo: Repository<WebhookEvent>,
-    @InjectRepository(Issue) private readonly issueRepo: Repository<Issue>,
     @InjectRepository(Bounty) private readonly bountyRepo: Repository<Bounty>,
     private readonly bountiesService: BountiesService,
     private readonly syncService: GithubSyncService,
@@ -274,22 +293,67 @@ export class GithubWebhooksService {
     // failure — an invalid state transition, an escrow release failure,
     // a Soroban error — doesn't abort processing of every other bounty
     // linked from the same merged PR (#47).
+    return this.processLinkedIssues(issueNumbers, payload, {
+      // A PR merged from CLAIMED is first moved into review (idempotent), then
+      // released; a bounty in any other state is released without the extra
+      // step, matching the merged-PR branch's original behaviour (#47).
+      requiredStatus: BountyStatus.CLAIMED,
+      alsoProcessOtherStatuses: true,
+      preAction: (bounty) =>
+        this.bountiesService.markInReview(
+          bounty.id,
+          payload.pull_request.html_url,
+          payload.pull_request.number,
+        ),
+      action: (bounty) => this.bountiesService.markMergedAndRelease(bounty.id),
+    });
+  }
+
+  /**
+   * Resolves every issue number linked from a pull_request body to its
+   * tracked issue + bounty, applies that branch's guard and action, and returns
+   * one outcome per issue so a single failure never hides the rest (#47).
+   *
+   * This is the single implementation shared by the merged-PR, PR-opened and
+   * PR-closed-without-merge branches (#316) — before extraction the three
+   * copies had already drifted, with the merged-PR branch skipping a
+   * non-CLAIMED bounty where the others skipped on their own status.
+   */
+  private async processLinkedIssues(
+    issueNumbers: number[],
+    payload: GithubPullRequestPayload,
+    {
+      requiredStatus,
+      action,
+      preAction,
+      alsoProcessOtherStatuses = false,
+    }: LinkedIssueAction,
+  ): Promise<LinkedIssueOutcome[]> {
+    // Resolved once per event rather than per linked issue: a PR body naming
+    // five issues would otherwise repeat the same repository lookup five times
+    // (#311).
+    const repository = await this.syncService.findRepositoryByGithubId(
+      String(payload.repository.id),
+    );
+
     const outcomes: LinkedIssueOutcome[] = [];
     for (const number of issueNumbers) {
       try {
-        const issue = await this.issueRepo.findOne({
-          where: {
-            number,
-            repository: { githubRepoId: String(payload.repository.id) },
-          },
-          relations: { repository: true, bounty: true },
-        });
+        if (!repository) {
+          outcomes.push({ issueNumber: number, outcome: 'skipped' });
+          continue;
+        }
+
+        const issue = await this.syncService.findIssueByRepoAndNumber(
+          repository.id,
+          number,
+          { repository: true, bounty: true },
+        );
         if (!issue?.bounty) {
           outcomes.push({ issueNumber: number, outcome: 'skipped' });
           continue;
         }
 
-        // Mark in_review first if it hadn't been (idempotent no-op if already there).
         const bounty = await this.bountyRepo.findOne({
           where: { id: issue.bounty.id },
         });
@@ -298,14 +362,19 @@ export class GithubWebhooksService {
           continue;
         }
 
-        if (bounty.status === BountyStatus.CLAIMED) {
-          await this.bountiesService.markInReview(
-            bounty.id,
-            payload.pull_request.html_url,
-            payload.pull_request.number,
-          );
+        if (bounty.status === requiredStatus) {
+          if (preAction) await preAction(bounty);
+          await action(bounty);
+          outcomes.push({ issueNumber: number, outcome: 'succeeded' });
+          continue;
         }
-        await this.bountiesService.markMergedAndRelease(bounty.id);
+
+        if (!alsoProcessOtherStatuses) {
+          outcomes.push({ issueNumber: number, outcome: 'skipped' });
+          continue;
+        }
+
+        await action(bounty);
         outcomes.push({ issueNumber: number, outcome: 'succeeded' });
       } catch (err) {
         outcomes.push({
@@ -399,44 +468,15 @@ export class GithubWebhooksService {
       return [];
     }
 
-    const outcomes: LinkedIssueOutcome[] = [];
-    for (const number of issueNumbers) {
-      try {
-        const issue = await this.issueRepo.findOne({
-          where: {
-            number,
-            repository: { githubRepoId: String(payload.repository.id) },
-          },
-          relations: { repository: true, bounty: true },
-        });
-        if (!issue?.bounty) {
-          outcomes.push({ issueNumber: number, outcome: 'skipped' });
-          continue;
-        }
-
-        const bounty = await this.bountyRepo.findOne({
-          where: { id: issue.bounty.id },
-        });
-        if (!bounty || bounty.status !== BountyStatus.CLAIMED) {
-          outcomes.push({ issueNumber: number, outcome: 'skipped' });
-          continue;
-        }
-
-        await this.bountiesService.markInReview(
+    return this.processLinkedIssues(issueNumbers, payload, {
+      requiredStatus: BountyStatus.CLAIMED,
+      action: (bounty) =>
+        this.bountiesService.markInReview(
           bounty.id,
           payload.pull_request.html_url,
           payload.pull_request.number,
-        );
-        outcomes.push({ issueNumber: number, outcome: 'succeeded' });
-      } catch (err) {
-        outcomes.push({
-          issueNumber: number,
-          outcome: 'failed',
-          error: (err as Error).message,
-        });
-      }
-    }
-    return outcomes;
+        ),
+    });
   }
 
   /**
@@ -458,39 +498,9 @@ export class GithubWebhooksService {
       return [];
     }
 
-    const outcomes: LinkedIssueOutcome[] = [];
-    for (const number of issueNumbers) {
-      try {
-        const issue = await this.issueRepo.findOne({
-          where: {
-            number,
-            repository: { githubRepoId: String(payload.repository.id) },
-          },
-          relations: { repository: true, bounty: true },
-        });
-        if (!issue?.bounty) {
-          outcomes.push({ issueNumber: number, outcome: 'skipped' });
-          continue;
-        }
-
-        const bounty = await this.bountyRepo.findOne({
-          where: { id: issue.bounty.id },
-        });
-        if (!bounty || bounty.status !== BountyStatus.IN_REVIEW) {
-          outcomes.push({ issueNumber: number, outcome: 'skipped' });
-          continue;
-        }
-
-        await this.bountiesService.markPrClosedWithoutMerge(bounty.id);
-        outcomes.push({ issueNumber: number, outcome: 'succeeded' });
-      } catch (err) {
-        outcomes.push({
-          issueNumber: number,
-          outcome: 'failed',
-          error: (err as Error).message,
-        });
-      }
-    }
-    return outcomes;
+    return this.processLinkedIssues(issueNumbers, payload, {
+      requiredStatus: BountyStatus.IN_REVIEW,
+      action: (bounty) => this.bountiesService.markPrClosedWithoutMerge(bounty.id),
+    });
   }
 }
