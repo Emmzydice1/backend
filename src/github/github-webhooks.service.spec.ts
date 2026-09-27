@@ -634,6 +634,241 @@ describe('GithubWebhooksService', () => {
     });
   });
 
+  describe('comma-separated closing references (#309)', () => {
+    /** Collects every issue number the merged-PR path ends up releasing. */
+    function releasedNumbers(): number[] {
+      return issueRepo.findOne.mock.calls.map(
+        (call: unknown[]) =>
+          (call[0] as { where: { number: number } }).where.number,
+      );
+    }
+
+    it('links every issue in a comma-separated list after one keyword', async () => {
+      issueRepo.findOne.mockResolvedValue(null);
+      await service.handleEvent(
+        'pull_request',
+        'delivery-comma-list',
+        {
+          action: 'closed',
+          number: 11,
+          pull_request: {
+            html_url: 'https://github.com/acme/repo/pull/11',
+            number: 11,
+            merged: true,
+            body: 'Closes #10, #22, #33',
+          },
+          repository: { id: 999, full_name: 'acme/repo' },
+        },
+        true,
+      );
+
+      expect(releasedNumbers()).toEqual([10, 22, 33]);
+    });
+
+    it('keeps parsing subsequent keyword lists after a comma run', async () => {
+      issueRepo.findOne.mockResolvedValue(null);
+      await service.handleEvent(
+        'pull_request',
+        'delivery-comma-then-keyword',
+        {
+          action: 'closed',
+          number: 12,
+          pull_request: {
+            html_url: 'https://github.com/acme/repo/pull/12',
+            number: 12,
+            merged: true,
+            body: 'This PR closes #10, #22, #33 and also fixes #99.',
+          },
+          repository: { id: 999, full_name: 'acme/repo' },
+        },
+        true,
+      );
+
+      expect(releasedNumbers()).toEqual([10, 22, 33, 99]);
+    });
+
+    it('stops the comma run at the first token that is not a reference', async () => {
+      issueRepo.findOne.mockResolvedValue(null);
+      await service.handleEvent(
+        'pull_request',
+        'delivery-comma-stops',
+        {
+          action: 'closed',
+          number: 13,
+          pull_request: {
+            html_url: 'https://github.com/acme/repo/pull/13',
+            number: 13,
+            merged: true,
+            body: 'Closes #1, and #2',
+          },
+          repository: { id: 999, full_name: 'acme/repo' },
+        },
+        true,
+      );
+
+      expect(releasedNumbers()).toEqual([1]);
+    });
+
+    it('skips a foreign-repo qualifier inside a comma run but keeps the rest', async () => {
+      issueRepo.findOne.mockResolvedValue(null);
+      await service.handleEvent(
+        'pull_request',
+        'delivery-comma-foreign',
+        {
+          action: 'closed',
+          number: 14,
+          pull_request: {
+            html_url: 'https://github.com/acme/repo/pull/14',
+            number: 14,
+            merged: true,
+            body: 'Fixes #7, some-other-org/other-repo#8, #9',
+          },
+          repository: { id: 999, full_name: 'acme/repo' },
+        },
+        true,
+      );
+
+      expect(releasedNumbers()).toEqual([7, 9]);
+    });
+
+    it('marks a comma-separated bounty in review when the PR is opened', async () => {
+      issueRepo.findOne.mockImplementation(
+        ({ where }: { where: { number: number } }) =>
+          Promise.resolve({
+            id: `issue-${where.number}`,
+            bounty: { id: `bounty-${where.number}` },
+          }),
+      );
+      bountyRepo.findOne.mockImplementation(
+        ({ where }: { where: { id: string } }) =>
+          Promise.resolve({ id: where.id, status: 'claimed' }),
+      );
+
+      await service.handleEvent(
+        'pull_request',
+        'delivery-comma-opened',
+        {
+          action: 'opened',
+          number: 15,
+          pull_request: {
+            html_url: 'https://github.com/acme/repo/pull/15',
+            number: 15,
+            merged: false,
+            body: 'Closes #10, #22, #33',
+          },
+          repository: { id: 999, full_name: 'acme/repo' },
+        },
+        true,
+      );
+
+      expect(bountiesService.markInReview).toHaveBeenCalledTimes(3);
+      expect(bountiesService.markInReview).toHaveBeenCalledWith(
+        'bounty-10',
+        'https://github.com/acme/repo/pull/15',
+        15,
+      );
+      expect(bountiesService.markInReview).toHaveBeenCalledWith(
+        'bounty-22',
+        'https://github.com/acme/repo/pull/15',
+        15,
+      );
+      expect(bountiesService.markInReview).toHaveBeenCalledWith(
+        'bounty-33',
+        'https://github.com/acme/repo/pull/15',
+        15,
+      );
+    });
+  });
+
+  describe('pull_request edited events (#310)', () => {
+    it('moves a bounty to in_review when a closing keyword is added after opening', async () => {
+      issueRepo.findOne.mockImplementation(
+        ({ where }: { where: { number: number } }) =>
+          Promise.resolve({
+            id: `issue-${where.number}`,
+            bounty: { id: 'bounty-42' },
+          }),
+      );
+      bountyRepo.findOne.mockImplementation(
+        ({ where }: { where: { id: string } }) =>
+          Promise.resolve({ id: where.id, status: 'claimed' }),
+      );
+
+      const event = await service.handleEvent(
+        'pull_request',
+        'delivery-edited',
+        {
+          action: 'edited',
+          number: 42,
+          pull_request: {
+            html_url: 'https://github.com/acme/repo/pull/42',
+            number: 42,
+            merged: false,
+            body: 'Added the description: Fixes #42',
+          },
+          repository: { id: 999, full_name: 'acme/repo' },
+        },
+        true,
+      );
+
+      expect(bountiesService.markInReview).toHaveBeenCalledWith(
+        'bounty-42',
+        'https://github.com/acme/repo/pull/42',
+        42,
+      );
+      expect(event.status).toBe(WebhookEventStatus.PROCESSED);
+    });
+
+    it('leaves a bounty already in_review untouched on a later body edit', async () => {
+      issueRepo.findOne.mockResolvedValue({
+        id: 'issue-42',
+        bounty: { id: 'bounty-42' },
+      });
+      bountyRepo.findOne.mockResolvedValue({
+        id: 'bounty-42',
+        status: 'in_review',
+      });
+
+      await service.handleEvent(
+        'pull_request',
+        'delivery-edited-idem',
+        {
+          action: 'edited',
+          number: 42,
+          pull_request: {
+            html_url: 'https://github.com/acme/repo/pull/42',
+            number: 42,
+            merged: false,
+            body: 'Fixes #42 (typo fixes)',
+          },
+          repository: { id: 999, full_name: 'acme/repo' },
+        },
+        true,
+      );
+
+      expect(bountiesService.markInReview).not.toHaveBeenCalled();
+    });
+
+    it('still ignores unrelated actions without touching bounties', async () => {
+      await service.handleEvent(
+        'pull_request',
+        'delivery-synchronize',
+        {
+          action: 'synchronize',
+          number: 42,
+          pull_request: {
+            html_url: 'https://github.com/acme/repo/pull/42',
+            number: 42,
+            merged: false,
+            body: 'Fixes #42',
+          },
+          repository: { id: 999, full_name: 'acme/repo' },
+        },
+        true,
+      );
+
+      expect(bountiesService.markInReview).not.toHaveBeenCalled();
+      expect(bountiesService.markMergedAndRelease).not.toHaveBeenCalled();
   // #308: a redelivered X-GitHub-Delivery used to hit the unique constraint
   // on webhook_events.deliveryId and escape handleEvent as a 500, so every
   // redelivery of that event failed forever.
